@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">ApplePods</string>
+    <string name="module_title">ApplePods · HyperOS 3</string>
+    <string name="module_summary">轻量补全 AirPods 自适应音频、对话感知与睡眠检测。模块不会替换系统弹窗、控制中心卡片或岛。</string>
+    <string name="module_hint">请在 LSPosed 中启用模块并重启手机，然后从系统蓝牙设置或控制中心操作 AirPods。</string>
+    <string name="status_connecting">正在连接 LSPosed 服务…</string>
+    <string name="status_inactive">未连接到 LSPosed 服务：模块尚未启用，或当前框架不支持现代 API 102。</string>
+</resources>

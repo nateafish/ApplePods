@@ -1,0 +1,645 @@
+package io.github.nathanxie.applepods.hook
+
+import android.bluetooth.BluetoothDevice
+import android.app.Activity
+import android.content.Context
+import android.content.ContentValues
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.ImageView
+import android.widget.Toast
+import java.lang.reflect.Proxy
+import java.io.File
+import java.util.WeakHashMap
+import io.github.nathanxie.applepods.protocol.ApplePodsAapProtocol
+import io.github.nathanxie.applepods.protocol.HyperOsAirPodsRepository
+
+/** Lightly augments HyperOS' existing AirPods detail page; it does not replace the page. */
+object ApplePodsSettingsHook : HookContext() {
+    private const val TAG = "ApplePods-Settings"
+    private const val ADAPTIVE_TAG = "applepods_adaptive_mode"
+    private const val PREF_CONVERSATION = "applepods_conversation_awareness"
+    private const val PREF_SLEEP = "applepods_sleep_detection"
+    private val adaptiveItems = WeakHashMap<Any, AdaptiveModeItem>()
+    private val observedFragments = WeakHashMap<Any, Boolean>()
+    private val nativeAncItems = WeakHashMap<Any, NativeAncItem>()
+    private var ancControllerHooksInstalled = false
+    private var resourceStackLogged = false
+
+    override fun onHook() {
+        runCatching {
+            val fragmentClass = findClass("com.android.settings.bluetooth.MiuiHeadsetFragment")
+            hookAfter(
+                fragmentClass.getDeclaredMethod(
+                    "onCreateView",
+                    LayoutInflater::class.java,
+                    ViewGroup::class.java,
+                    Bundle::class.java,
+                ).apply { isAccessible = true }
+            ) {
+                val fragment = instance ?: return@hookAfter
+                Log.i(TAG, "onCreateView callback hit: ${fragment.javaClass.name}")
+                val root = result as? View ?: getObjectField(fragment, "mRootView") as? View
+                    ?: run {
+                        Log.i(TAG, "skip: root view unavailable")
+                        return@hookAfter
+                    }
+                val device = getObjectField(fragment, "mDevice") as? BluetoothDevice
+                    ?: run {
+                        Log.i(TAG, "skip: BluetoothDevice unavailable")
+                        return@hookAfter
+                    }
+                // Reaching MiuiHeadsetFragment with an mDevice is the OEM's own support decision.
+                // Its provider-side ConnectL2cap probe is not reliable from the Settings process.
+                Log.i(TAG, "injecting device=${device.name} address=${device.address}")
+                installFeaturePreferences(fragment, root, device)
+                HyperOsAirPodsRepository.observe(root, device) { key, value ->
+                    when (key) {
+                        HyperOsAirPodsRepository.KEY_ANC ->
+                            adaptiveItems[fragment]?.setAdaptiveSelected(value == ApplePodsAapProtocol.MODE_ADAPTIVE.toString())
+                        HyperOsAirPodsRepository.KEY_CONVERSATION_AWARENESS ->
+                            findPreference(fragment, PREF_CONVERSATION)?.let {
+                                invokeExact(it, "setChecked", arrayOf(Boolean::class.javaPrimitiveType!!), value == "1")
+                            }
+                        HyperOsAirPodsRepository.KEY_SLEEP_DETECTION ->
+                            findPreference(fragment, PREF_SLEEP)?.let {
+                                invokeExact(it, "setChecked", arrayOf(Boolean::class.javaPrimitiveType!!), value == "1")
+                            }
+                    }
+                }
+            }
+            fragmentClass.declaredMethods.firstOrNull {
+                it.name == "onResume" && it.parameterTypes.isEmpty()
+            }?.apply { isAccessible = true }?.let { method ->
+                hookAfter(method) {
+                    val fragment = instance ?: return@hookAfter
+                    Log.i(TAG, "onResume callback hit: ${fragment.javaClass.name}")
+                    injectFromFragment(fragment)
+                }
+            }
+            fragmentClass.declaredMethods.firstOrNull {
+                it.name == "onServiceConnected" && it.parameterTypes.isEmpty()
+            }?.apply { isAccessible = true }?.let { method ->
+                hookAfter(method) {
+                    val fragment = instance ?: return@hookAfter
+                    Log.i(TAG, "onServiceConnected callback hit: ${fragment.javaClass.name}")
+                    injectFromFragment(fragment)
+                }
+            }
+            hookAfter(Activity::class.java.getDeclaredMethod("onResume").apply { isAccessible = true }) {
+                val activity = instance as? Activity ?: return@hookAfter
+                if (activity.javaClass.name != "plugin.settings.java.JavaActivity") return@hookAfter
+                Log.i(TAG, "plugin JavaActivity resumed")
+                activity.window.decorView.post {
+                    injectFromPluginActivity(activity)
+                    activity.window.decorView.postDelayed({ injectFromPluginActivity(activity) }, 500L)
+                }
+            }
+            Log.i(TAG, "MiuiHeadsetFragment light injection installed")
+        }.onFailure { Log.e(TAG, "MiuiHeadsetFragment hook unavailable", it) }
+    }
+
+    private fun injectFromPluginActivity(activity: Activity) {
+        val extras = activity.intent?.extras
+        Log.i(TAG, "plugin extras=${extras?.keySet()?.joinToString { key ->
+            "$key:${runCatching { extras.get(key)?.javaClass?.name }.getOrNull()}"
+        }}")
+        val device = findBluetoothDevice(extras)
+            ?: HyperOsAirPodsRepository.connectedAirPods(activity)
+            ?: run {
+            Log.i(TAG, "plugin injection skipped: connected AirPods unavailable")
+            return
+        }
+        val root = activity.window.decorView
+        logOemResourceStack(root)
+        val fragment = findHeadsetFragment(activity) ?: run {
+            Log.i(TAG, "plugin fragment not found; injecting adaptive from decor")
+            return
+        }
+        Log.i(TAG, "plugin fragment resolved: ${fragment.javaClass.name}")
+        installNativeAncExtension(fragment, root)
+        installFeaturePreferences(fragment, root, device)
+        ensureLiveState(fragment, root, device)
+    }
+
+    private fun installNativeAncExtension(fragment: Any, root: View) {
+        val controller = runCatching { getObjectField(fragment, "mAncController") }.getOrNull() ?: run {
+            Log.i(TAG, "native ANC skipped: mAncController is null")
+            return
+        }
+        installAncControllerHooks(controller.javaClass)
+        if (nativeAncItems.containsKey(controller)) return
+        val transparent = getObjectField(controller, "mAncTransparent") as? View ?: run {
+            Log.i(TAG, "native ANC skipped: mAncTransparent is null")
+            return
+        }
+        val parent = transparent.parent as? LinearLayout ?: run {
+            Log.i(TAG, "native ANC skipped: parent=${transparent.parent?.javaClass?.name}")
+            return
+        }
+        val layoutId = pluginResource(fragment, root, "layout", "anc_transparent_basic")
+        if (layoutId == 0) {
+            Log.i(TAG, "native ANC skipped: anc_transparent_basic resource missing")
+            return
+        }
+        val wrapper = LinearLayout(root.context).apply {
+            gravity = (transparent as? LinearLayout)?.gravity ?: android.view.Gravity.CENTER
+            tag = ADAPTIVE_TAG
+        }
+        val content = LayoutInflater.from(root.context).inflate(layoutId, wrapper, false)
+        wrapper.addView(content)
+        val old = transparent.layoutParams
+        wrapper.layoutParams = LinearLayout.LayoutParams(0, old.height, 1f).apply {
+            if (old is ViewGroup.MarginLayoutParams) {
+                setMargins(old.leftMargin, old.topMargin, old.rightMargin, old.bottomMargin)
+            }
+        }
+        normalizeWeights(parent)
+        parent.addView(wrapper)
+        val imageId = pluginResource(fragment, root, "id", "transparentAncImage")
+        val textId = pluginResource(fragment, root, "id", "transparentAncText")
+        val image = content.findViewById<ImageView>(imageId)
+            ?: findDescendant(content, ImageView::class.java)
+        val text = content.findViewById<android.widget.TextView>(textId)
+            ?: findDescendant(content, android.widget.TextView::class.java)
+        text?.text = AdaptiveModeItem.localized(root.context, "自适应", "Adaptive")
+        val item = NativeAncItem(
+            wrapper,
+            image,
+            text,
+            pluginResource(fragment, root, "drawable", "transparent_on"),
+            pluginResource(fragment, root, "drawable", "transparent_off"),
+            pluginResource(fragment, root, "color", "anc_text_color"),
+            pluginResource(fragment, root, "color", "first_text_color"),
+        )
+        nativeAncItems[controller] = item
+        wrapper.setOnClickListener {
+            controller.javaClass.getMethod("setAncForUser", Int::class.javaPrimitiveType).invoke(
+                controller,
+                ApplePodsAapProtocol.MODE_ADAPTIVE,
+            )
+        }
+        val current = getObjectField(controller, "mCurrentAnc") as? Int ?: 0
+        renderNativeAnc(item, current == ApplePodsAapProtocol.MODE_ADAPTIVE)
+        Log.i(TAG, "adaptive mode attached to native AncController")
+    }
+
+    private fun installAncControllerHooks(controllerClass: Class<*>) {
+        if (ancControllerHooksInstalled) return
+        synchronized(this) {
+            if (ancControllerHooksInstalled) return
+            hookBefore(controllerClass.getMethod("toAncCode", String::class.java)) {
+                val wire = args.firstOrNull() as? String ?: return@hookBefore
+                if (wire.trimStart('0') == "4") result = ApplePodsAapProtocol.MODE_ADAPTIVE
+            }
+            hookBefore(controllerClass.getMethod("toCommandCode", Int::class.javaPrimitiveType)) {
+                if (args.firstOrNull() == ApplePodsAapProtocol.MODE_ADAPTIVE) result = "04"
+            }
+            val checkAccess = controllerClass.getMethod(
+                "checkAncAccess",
+                Context::class.java,
+                BluetoothDevice::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            hookBefore(checkAccess) {
+                if (args.getOrNull(2) != ApplePodsAapProtocol.MODE_ADAPTIVE) return@hookBefore
+                // Adaptive has the same wear/access rules as transparency in the OEM controller.
+                result = checkAccess.invoke(instance, args[0], args[1], 3) as Boolean
+            }
+            hookAfter(controllerClass.getMethod(
+                "updateView", Context::class.java, Int::class.javaPrimitiveType,
+            )) {
+                val controller = instance ?: return@hookAfter
+                val mode = args.getOrNull(1) as? Int ?: return@hookAfter
+                nativeAncItems[controller]?.let {
+                    val adaptive = mode == ApplePodsAapProtocol.MODE_ADAPTIVE
+                    if (adaptive) {
+                        clearNativeAncSelection(controller)
+                        runCatching {
+                            controllerClass.getDeclaredField("mCurrentAnc").apply {
+                                isAccessible = true
+                            }.setInt(controller, ApplePodsAapProtocol.MODE_ADAPTIVE)
+                        }
+                    }
+                    renderNativeAnc(it, adaptive)
+                }
+            }
+            ancControllerHooksInstalled = true
+        }
+    }
+
+    private fun clearNativeAncSelection(controller: Any) {
+        listOf(
+            "mAncOn", "mAncOff", "mAncTransparent",
+            "mAncOnImage", "mAncOffImage", "mAncTransparentImage",
+            "mAncOnText", "mAncOffText", "mAncTransparentText",
+        ).forEach { field ->
+            (runCatching { getObjectField(controller, field) }.getOrNull() as? View)
+                ?.isSelected = false
+        }
+    }
+
+    private fun renderNativeAnc(item: NativeAncItem, selected: Boolean) {
+        item.wrapper.isSelected = selected
+        item.image?.isSelected = selected
+        item.text?.isSelected = selected
+        val drawable = if (selected) item.drawableOn else item.drawableOff
+        if (drawable != 0) item.image?.setImageResource(drawable)
+        val color = if (selected) item.colorOn else item.colorOff
+        if (color != 0) item.text?.setTextColor(item.wrapper.context.getColor(color))
+    }
+
+    /** Dynamic Settings plugins use their own relocated resource package. */
+    private fun pluginResource(fragment: Any, root: View, type: String, name: String): Int {
+        val reflected = runCatching {
+            Class.forName(
+                "plugin.settings.java.R\$$type",
+                false,
+                fragment.javaClass.classLoader,
+            ).getField(name).getInt(null)
+        }.getOrDefault(0)
+        if (reflected != 0) return reflected
+
+        val runtimePackage = runCatching {
+            val controller = getObjectField(fragment, "mAncController")
+            val transparent = controller?.let { getObjectField(it, "mAncTransparent") } as? View
+            transparent?.id?.takeIf { it != View.NO_ID }?.let(root.resources::getResourcePackageName)
+        }.getOrNull()
+        return listOfNotNull(runtimePackage, "plugin.settings.java", root.context.packageName)
+            .distinct()
+            .firstNotNullOfOrNull { pkg ->
+                root.resources.getIdentifier(name, type, pkg).takeIf { it != 0 }
+            } ?: 0
+    }
+
+    private fun <T : View> findDescendant(root: View, type: Class<T>): T? {
+        if (type.isInstance(root)) return type.cast(root)
+        val group = root as? ViewGroup ?: return null
+        for (index in 0 until group.childCount) {
+            findDescendant(group.getChildAt(index), type)?.let { return it }
+        }
+        return null
+    }
+
+    private data class NativeAncItem(
+        val wrapper: View,
+        val image: ImageView?,
+        val text: android.widget.TextView?,
+        val drawableOn: Int,
+        val drawableOff: Int,
+        val colorOn: Int,
+        val colorOff: Int,
+    )
+
+    private fun findBluetoothDevice(bundle: Bundle?, depth: Int = 0): BluetoothDevice? {
+        if (bundle == null || depth > 2) return null
+        for (key in bundle.keySet()) {
+            val value = runCatching { bundle.get(key) }.getOrNull()
+            when (value) {
+                is BluetoothDevice -> return value
+                is Bundle -> findBluetoothDevice(value, depth + 1)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun findHeadsetFragment(activity: Activity): Any? {
+        val manager = runCatching { callMethod(activity, "getSupportFragmentManager") }.getOrNull()
+            ?: runCatching { callMethod(activity, "getFragmentManager") }.getOrNull()
+            ?: return null
+        return findHeadsetFragmentInManager(manager, mutableSetOf())
+    }
+
+    private fun findHeadsetFragmentInManager(manager: Any, visited: MutableSet<Any>): Any? {
+        if (!visited.add(manager)) return null
+        val fragments = runCatching { callMethod(manager, "getFragments") as? List<*> }
+            .getOrNull().orEmpty()
+        for (fragment in fragments.filterNotNull()) {
+            if (
+                fragment.javaClass.name == "com.android.settings.bluetooth.MiuiHeadsetFragment" ||
+                fragment.javaClass.name == "plugin.settings.java.airpods.MiuiAirpodsFragment"
+            ) {
+                return fragment
+            }
+            val child = runCatching { callMethod(fragment, "getChildFragmentManager") }.getOrNull()
+            if (child != null) findHeadsetFragmentInManager(child, visited)?.let { return it }
+        }
+        Log.i(TAG, "visible plugin fragments=${fragments.filterNotNull().joinToString { it.javaClass.name }}")
+        return null
+    }
+
+    private fun injectFromFragment(fragment: Any) {
+        val root = getObjectField(fragment, "mRootView") as? View ?: run {
+            Log.i(TAG, "resume injection skipped: mRootView unavailable")
+            return
+        }
+        val device = getObjectField(fragment, "mDevice") as? BluetoothDevice ?: run {
+            Log.i(TAG, "resume injection skipped: mDevice unavailable")
+            return
+        }
+        Log.i(TAG, "resume injecting device=${device.name} address=${device.address}")
+        logOemResourceStack(root)
+        installFeaturePreferences(fragment, root, device)
+        ensureLiveState(fragment, root, device)
+    }
+
+    private fun ensureLiveState(fragment: Any, root: View, device: BluetoothDevice) {
+        if (observedFragments.put(fragment, true) != true) {
+            HyperOsAirPodsRepository.observe(root, device) { key, value ->
+                when (key) {
+                    HyperOsAirPodsRepository.KEY_ANC ->
+                        updateModeSelection(
+                            root,
+                            adaptiveItems[fragment],
+                            value == ApplePodsAapProtocol.MODE_ADAPTIVE.toString(),
+                        )
+                    HyperOsAirPodsRepository.KEY_CONVERSATION_AWARENESS ->
+                        findPreference(fragment, PREF_CONVERSATION)?.let {
+                            invokeExact(it, "setChecked", arrayOf(Boolean::class.javaPrimitiveType!!), value == "1")
+                        }
+                    HyperOsAirPodsRepository.KEY_SLEEP_DETECTION ->
+                        findPreference(fragment, PREF_SLEEP)?.let {
+                            invokeExact(it, "setChecked", arrayOf(Boolean::class.javaPrimitiveType!!), value == "1")
+                        }
+                }
+            }
+        }
+    }
+
+    private fun logOemResourceStack(root: View) {
+        if (resourceStackLogged) return
+        resourceStackLogged = true
+        val apkAssets = runCatching {
+            root.resources.assets.javaClass.getMethod("getApkAssets").invoke(root.resources.assets) as? Array<*>
+        }.getOrNull().orEmpty()
+        val paths = apkAssets.joinToString { asset ->
+            runCatching { asset!!.javaClass.getMethod("getAssetPath").invoke(asset).toString() }
+                .getOrDefault(asset.toString())
+        }
+        Log.i(TAG, "AirPods resource stack=$paths")
+        apkAssets.mapNotNull { asset ->
+            runCatching { asset!!.javaClass.getMethod("getAssetPath").invoke(asset).toString() }.getOrNull()
+        }.firstOrNull { it.contains("/app_qigsaw/") && it.endsWith(".apk") }?.let { path ->
+            exportPlugin(root.context, path)
+        }
+        root.walkViews().filterIsInstance<ImageView>().forEach { image ->
+            val idName = image.id.takeIf { it != View.NO_ID }?.let {
+                runCatching { root.resources.getResourceName(it) }.getOrNull()
+            }
+            val drawableName = image.drawable?.let { drawable ->
+                runCatching { drawable.javaClass.name + ":" + drawable.constantState }.getOrNull()
+            }
+            if (idName != null) Log.i(TAG, "OEM ImageView id=$idName drawable=$drawableName")
+        }
+    }
+
+    private fun exportPlugin(context: Context, path: String) = runCatching {
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, "SettingsAirPodsPlugin.apk")
+            put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive")
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+        val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: error("MediaStore insert failed")
+        File(path).inputStream().use { input ->
+            context.contentResolver.openOutputStream(uri)?.use { output -> input.copyTo(output) }
+                ?: error("MediaStore output unavailable")
+        }
+        Log.i(TAG, "exported AirPods plugin to $uri")
+    }.onFailure { Log.e(TAG, "AirPods plugin export failed", it) }
+
+    private fun installAdaptiveMode(fragment: Any, root: View, device: BluetoothDevice) {
+        if (adaptiveItems[fragment]?.parent != null) return
+        val close = root.findNamedView("closeAnc")
+            ?: root.findClickableMode(AdaptiveModeItem.localized(root.context, "关闭", "Off"))
+            ?: run {
+                Log.i(TAG, "adaptive skipped: close ANC view not found")
+                return
+            }
+        val parent = close.parent as? LinearLayout ?: return
+        if ((0 until parent.childCount).any { parent.getChildAt(it).tag == ADAPTIVE_TAG }) return
+
+        normalizeWeights(parent)
+        val item = AdaptiveModeItem(root.context).apply {
+            tag = ADAPTIVE_TAG
+            minimumHeight = close.height
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                close.height.takeIf { it > 0 } ?: close.layoutParams.height,
+                1f,
+            )
+            setOnClickListener {
+                val sent = HyperOsAirPodsRepository.sendAncMode(
+                    context,
+                    device,
+                    ApplePodsAapProtocol.MODE_ADAPTIVE,
+                )
+                // Keep the OEM state machine authoritative. Selection changes only after the
+                // AirPods echoes 0x0D=0x04, avoiding a false fourth-state highlight on rejection.
+                if (!sent) showSendFailed(root)
+            }
+        }
+        parent.addView(item)
+        Log.i(TAG, "adaptive control inserted; modeCount=${parent.childCount}")
+        adaptiveItems[fragment] = item
+        val current = HyperOsAirPodsRepository.getState(root.context, device, HyperOsAirPodsRepository.KEY_ANC)
+        updateModeSelection(root, item, current == ApplePodsAapProtocol.MODE_ADAPTIVE.toString())
+    }
+
+    private fun updateModeSelection(root: View, adaptive: AdaptiveModeItem?, selected: Boolean) {
+        adaptive?.setAdaptiveSelected(selected)
+        if (!selected) return
+        listOf(
+            "openAnc" to "openanc_off",
+            "transparentAnc" to "transparent_off",
+            "closeAnc" to "closeanc_off",
+        ).forEach { (viewName, offDrawableName) ->
+            val mode = root.findNamedView(viewName) ?: return@forEach
+            mode.isSelected = false
+            mode.isActivated = false
+            mode.walkViews().filterIsInstance<ImageView>().forEach { image ->
+                val drawableId = root.resources.getIdentifier(
+                    offDrawableName,
+                    "drawable",
+                    root.context.packageName,
+                )
+                if (drawableId != 0) image.setImageResource(drawableId)
+                image.isSelected = false
+                image.isActivated = false
+            }
+        }
+    }
+
+    private fun normalizeWeights(parent: LinearLayout) {
+        for (index in 0 until parent.childCount) {
+            val child = parent.getChildAt(index)
+            val old = child.layoutParams
+            child.layoutParams = LinearLayout.LayoutParams(0, old.height, 1f).apply {
+                if (old is ViewGroup.MarginLayoutParams) {
+                    setMargins(old.leftMargin, old.topMargin, old.rightMargin, old.bottomMargin)
+                }
+            }
+        }
+    }
+
+    private fun installFeaturePreferences(fragment: Any, root: View, device: BluetoothDevice) {
+        val screen = invokeExact(fragment, "getPreferenceScreen", emptyArray()) ?: run {
+            Log.i(TAG, "feature switches skipped: preference screen unavailable")
+            return
+        }
+        val preferenceClass = findClass("androidx.preference.Preference")
+        val findOrder = findPreferenceOrderByTitle(
+            screen,
+            AdaptiveModeItem.localized(root.context, "查找", "Find My"),
+        )
+        if (invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), PREF_CONVERSATION) == null) {
+            invokeExact(screen, "addPreference", arrayOf(preferenceClass), featurePreference(
+                screen,
+                device,
+                PREF_CONVERSATION,
+                HyperOsAirPodsRepository.KEY_CONVERSATION_AWARENESS,
+                AdaptiveModeItem.localized(root.context, "对话感知", "Conversation Awareness"),
+                AdaptiveModeItem.localized(
+                    root.context,
+                    "检测到你开口说话时自动降低媒体音量并增强人声",
+                    "Lowers media and emphasizes voices when you start speaking",
+                ),
+                findOrder?.minus(2),
+            ))
+        }
+        if (invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), PREF_SLEEP) == null) {
+            invokeExact(screen, "addPreference", arrayOf(preferenceClass), featurePreference(
+                screen,
+                device,
+                PREF_SLEEP,
+                HyperOsAirPodsRepository.KEY_SLEEP_DETECTION,
+                AdaptiveModeItem.localized(root.context, "睡眠检测", "Sleep Detection"),
+                AdaptiveModeItem.localized(
+                    root.context,
+                    "佩戴耳机入睡后，由 AirPods 自动暂停播放",
+                    "Lets AirPods pause playback after you fall asleep",
+                ),
+                findOrder?.minus(1),
+            ))
+        }
+        Log.i(TAG, "conversation and sleep preferences installed")
+    }
+
+    private fun featurePreference(
+        screen: Any,
+        device: BluetoothDevice,
+        preferenceKey: String,
+        repositoryKey: String,
+        preferenceTitle: String,
+        preferenceSummary: String,
+        order: Int?,
+    ): Any {
+        val context = invokeExact(screen, "getContext", emptyArray()) as Context
+        val preferenceClass = findClass("androidx.preference.CheckBoxPreference")
+        val preference = preferenceClass.getConstructor(Context::class.java).newInstance(context)
+        invokeExact(preference, "setKey", arrayOf(String::class.java), preferenceKey)
+        invokeExact(preference, "setTitle", arrayOf(CharSequence::class.java), preferenceTitle)
+        invokeExact(preference, "setSummary", arrayOf(CharSequence::class.java), preferenceSummary)
+        invokeExact(
+            preference,
+            "setOrder",
+            arrayOf(Int::class.javaPrimitiveType!!),
+            order ?: (Int.MAX_VALUE - if (preferenceKey == PREF_CONVERSATION) 1 else 0),
+        )
+        invokeExact(preference, "setPersistent", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        invokeExact(
+            preference,
+            "setChecked",
+            arrayOf(Boolean::class.javaPrimitiveType!!),
+            HyperOsAirPodsRepository.getBooleanState(context, device, repositoryKey),
+        )
+        val listenerClass = findClass("androidx.preference.Preference\$OnPreferenceChangeListener")
+        val listener = Proxy.newProxyInstance(appClassLoader, arrayOf(listenerClass)) { _, method, args ->
+            if (method.name != "onPreferenceChange") return@newProxyInstance null
+            val enabled = args?.getOrNull(1) as? Boolean ?: return@newProxyInstance false
+            val sent = HyperOsAirPodsRepository.sendBooleanControl(context, device, repositoryKey, enabled)
+            if (!sent) showSendFailed(preference)
+            sent
+        }
+        invokeExact(preference, "setOnPreferenceChangeListener", arrayOf(listenerClass), listener)
+        return preference
+    }
+
+    private fun findPreferenceOrderByTitle(screen: Any, expectedTitle: String): Int? {
+        val count = invokeExact(screen, "getPreferenceCount", emptyArray()) as? Int ?: return null
+        for (index in 0 until count) {
+            val preference = invokeExact(
+                screen,
+                "getPreference",
+                arrayOf(Int::class.javaPrimitiveType!!),
+                index,
+            ) ?: continue
+            val title = invokeExact(preference, "getTitle", emptyArray())?.toString() ?: continue
+            if (title == expectedTitle || title.contains(expectedTitle, ignoreCase = true)) {
+                return invokeExact(preference, "getOrder", emptyArray()) as? Int
+            }
+        }
+        Log.i(TAG, "Find My preference not found; using trailing fallback order")
+        return null
+    }
+
+    private fun findPreference(fragment: Any, key: String): Any? =
+        invokeExact(fragment, "getPreferenceScreen", emptyArray())?.let {
+            invokeExact(it, "findPreference", arrayOf(CharSequence::class.java), key)
+        }
+
+    /** Selects the intended overload in HyperOS' own androidx classes. */
+    private fun invokeExact(
+        receiver: Any,
+        name: String,
+        parameterTypes: Array<Class<*>>,
+        vararg args: Any?,
+    ): Any? = receiver.javaClass.getMethod(name, *parameterTypes).invoke(receiver, *args)
+
+    private fun View.findNamedView(name: String): View? {
+        val id = resources.getIdentifier(name, "id", context.packageName)
+        return if (id == 0) null else findViewById(id)
+    }
+
+    private fun View.findClickableMode(label: String): View? {
+        if (this is android.widget.TextView && text?.toString() == label) {
+            var candidate: View = this
+            while (candidate.parent is View && !candidate.isClickable) {
+                candidate = candidate.parent as View
+            }
+            if (candidate.isClickable) return candidate
+        }
+        if (this is ViewGroup) {
+            for (index in 0 until childCount) {
+                getChildAt(index).findClickableMode(label)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun showSendFailed(view: Any) {
+        val context = when (view) {
+            is View -> view.context
+            else -> runCatching {
+                invokeExact(view, "getContext", emptyArray()) as? Context
+            }.getOrNull() ?: return
+        }
+        Toast.makeText(
+            context,
+            AdaptiveModeItem.localized(context, "AirPods 指令发送失败，请确认耳机已连接", "AirPods command failed; check the connection"),
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+}
+
+private fun View.walkViews(): Sequence<View> = sequence {
+    yield(this@walkViews)
+    if (this@walkViews is ViewGroup) {
+        for (index in 0 until childCount) yieldAll(getChildAt(index).walkViews())
+    }
+}
