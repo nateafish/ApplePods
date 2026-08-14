@@ -84,11 +84,6 @@ HyperOS 的 AirPods 页面和控制中心使用两套独立实现：
 - [CAPod](https://github.com/d4rken-org/capod)
 - [LibrePods](https://github.com/kavishdevar/librepods)
 - [HuaweiPods](https://modules.lsposed.org/module/moe.chenxy.huaweipods/)
-- OppoPods by Leaf-lsgtky
-- OppoPods by 1812z
-- HyperPods by Art_Chen
-- HyperIsland by 1812z
-- Miuix
 
 Apple、AirPods、HyperOS、小米及相关名称和商标归各自权利人所有。本项目与 Apple 或小米没有隶属、赞助或官方关联。
 
