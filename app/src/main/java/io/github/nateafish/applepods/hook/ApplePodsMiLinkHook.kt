@@ -3,8 +3,10 @@ package io.github.nateafish.applepods.hook
 import android.graphics.Color
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.LayerDrawable
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -43,7 +45,6 @@ object ApplePodsMiLinkHook : HookContext() {
     private class AdaptiveCenteredSeekBar(context: android.content.Context) : SeekBar(context) {
         private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val activePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private var thumbInsetPx = 0
 
         init {
             // The drawable is intentionally transparent; onDraw below owns only the track.
@@ -56,11 +57,8 @@ object ApplePodsMiLinkHook : HookContext() {
             activePaint.color = 0x80FFFFFF.toInt()
         }
 
-        fun setThumbInset(inset: Int) {
-            thumbInsetPx = inset.coerceAtLeast(0)
-            setPadding(thumbInsetPx, paddingTop, thumbInsetPx, paddingBottom)
-            // Padding already insets both ends symmetrically. thumbOffset is an extra shift and
-            // would make the two endpoints asymmetric, so keep it at zero.
+        fun alignThumbToTrackEdges() {
+            setPadding(0, paddingTop, 0, paddingBottom)
             thumbOffset = 0
         }
 
@@ -76,8 +74,7 @@ object ApplePodsMiLinkHook : HookContext() {
                 val radius = trackHeight / 2f
                 val center = width / 2f
                 val fraction = if (max > 0) progress.toFloat() / max else 0.5f
-                val thumbTravel = (width - 2f * thumbInsetPx).coerceAtLeast(0f)
-                val thumbCenter = thumbInsetPx + thumbTravel * fraction
+                val thumbCenter = width * fraction
                 canvas.drawRoundRect(0f, top, width, top + trackHeight, radius, radius, trackPaint)
                 if (fraction < 0.5f) {
                     canvas.drawRoundRect(thumbCenter, top, center, top + trackHeight, radius, radius, activePaint)
@@ -574,6 +571,15 @@ object ApplePodsMiLinkHook : HookContext() {
             ?: 0
     }.getOrDefault(0)
 
+    /**
+     * MIUI X wraps its 20dp circle in a LayerDrawable with a hard-coded 4dp inset on every side.
+     * The stock Thumb style compensates with matching SeekBar padding, but this full-width track
+     * intentionally has no endpoint padding. Reuse the exact MIUI X circle while dropping only
+     * that outer inset wrapper so the visible thumb and custom track share the same geometry.
+     */
+    private fun withoutMiuixThumbInset(drawable: Drawable): Drawable =
+        ((drawable as? LayerDrawable)?.getDrawable(0) ?: drawable).mutate()
+
     /** Replace the volume-only left-to-right MiPlay bar with the centered adaptive SeekBar. */
     private fun replaceWithCenteredSeekBar(slider: View): SeekBar? = runCatching {
         val old = slider.findViewById<SeekBar>(resourceId(slider.context, "volume_row_sliderr"))
@@ -589,10 +595,12 @@ object ApplePodsMiLinkHook : HookContext() {
             "drawable",
             slider.context.packageName,
         )
-        if (thumbId != 0) centered.thumb = slider.context.getDrawable(thumbId)
-        // No extra endpoint margin anywhere: thumb centers align with the track edges.
-        val thumbInset = 0
-        centered.setThumbInset(thumbInset)
+        if (thumbId != 0) {
+            slider.context.getDrawable(thumbId)?.let {
+                centered.thumb = withoutMiuixThumbInset(it)
+            }
+        }
+        centered.alignThumbToTrackEdges()
         parent.clipToPadding = false
         parent.clipChildren = false
         val index = parent.indexOfChild(old)
