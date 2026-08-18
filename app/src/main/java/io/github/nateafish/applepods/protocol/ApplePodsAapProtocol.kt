@@ -10,6 +10,7 @@ object ApplePodsAapProtocol {
     const val ID_LISTENING_MODE: Byte = 0x0D
     const val ID_CONVERSATION_AWARENESS: Byte = 0x28
     const val ID_SLEEP_DETECTION: Byte = 0x35
+    const val ID_AUTO_ANC_STRENGTH: Byte = 0x2E
 
     val handshake = byteArrayOf(
         0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00,
@@ -31,6 +32,16 @@ object ApplePodsAapProtocol {
 
     fun booleanControl(identifier: Byte, enabled: Boolean): ByteArray =
         control(identifier, if (enabled) 0x01 else 0x02)
+
+    /**
+     * CAPod calls this AdaptiveAudioNoise. The UI value is intuitive (0..100, more means more
+     * ambient sound), while AAP stores the inverse strength on the wire.
+     */
+    fun adaptiveAudioNoise(level: Int): ByteArray =
+        control(ID_AUTO_ANC_STRENGTH, (100 - level.coerceIn(0, 100)).toByte())
+
+    fun decodeAdaptiveAudioNoise(wireValue: Int): Int =
+        100 - wireValue.coerceIn(0, 100)
 
     fun control(identifier: Byte, value: Byte): ByteArray = byteArrayOf(
         0x04, 0x00, 0x04, 0x00, 0x09, 0x00,
