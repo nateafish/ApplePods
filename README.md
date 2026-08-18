@@ -1,6 +1,6 @@
 # ApplePods
 
-ApplePods 是一个面向 **HyperOS 3** 的现代 LSPosed 模块，用于补全小米系统已内置的 AirPods 支持。
+ApplePods 是一个当前主要适配 **HyperOS 4**、同时保留 **HyperOS 3** 兼容路径的现代 LSPosed 模块，用于补全小米系统已内置的 AirPods 支持。
 
 项目采用轻量注入方式：保留 HyperOS 原有的耳机详情页、控制中心卡片、连接弹窗和系统交互，只在原厂缺失的位置补充功能。目前仍处于早期测试阶段，不建议在无法恢复模块环境的主力设备上使用。
 
@@ -17,10 +17,12 @@ ApplePods 是一个面向 **HyperOS 3** 的现代 LSPosed 模块，用于补全�
   - `04`：自适应
 - 在系统耳机设置中补充“对话感知”和“睡眠检测”开关，并读取耳机已有状态。
 - 复用 HyperOS 原厂布局、图标和选中颜色；当前自适应暂时复用通透图标。
+- 自适应状态采用 CAPod 风格的 pending/confirmed 机制：发送 `04` 后等待耳机真实回报码 `04`，忽略短暂的原生旧状态，避免状态被系统回写覆盖。
 
 ## 兼容要求
 
-- HyperOS 3
+- HyperOS 4（当前主要适配和实机验证版本）
+- HyperOS 3（保留兼容路径，验证覆盖低于 HyperOS 4）
 - Android 15 及以上（模块 `minSdk 35`）
 - 支持现代模块 API 的 LSPosed，API 版本 **102**
 - 当前主要在 AirPods Pro 2 上验证
@@ -31,7 +33,7 @@ ApplePods 是一个面向 **HyperOS 3** 的现代 LSPosed 模块，用于补全�
 - `com.xiaomi.bluetooth`
 - `com.milink.service`
 
-其他 HyperOS 版本、平板系统、国际版系统或不同 AirPods 型号可能使用不同的类名、资源 ID 和协议路径，暂未保证兼容。
+HyperOS 4 的蓝牙扩展仍运行在 `com.xiaomi.bluetooth`；其中 AirPods Repository 实现从 HyperOS 3 的 `p0.a` 迁移为 `k1.a`，AAP 接收入口为 `x2.b.f()`。其他系统版本、平板系统、国际版系统或不同 AirPods 型号可能使用不同的类名、资源 ID 和协议路径，暂未保证兼容。
 
 ## 安装
 
@@ -64,12 +66,15 @@ app/build/outputs/apk/debug/app-debug.apk
 HyperOS 的 AirPods 页面和控制中心使用两套独立实现：
 
 - 设置页通过动态加载的 `plugin.settings.java.airpods.AncController` 管理原厂三态控件。模块从插件自身的运行时资源表加载布局和样式，并扩展模式编码与状态刷新。
-- 控制中心由 `com.miui.circulateplus.world.headset` 管理。模块扩展其原厂 View、图标、标题和模式数组；HyperOS 会把未知的 AirPods `04` 映射成 `-1`，模块会回查原厂 AirPods Repository，仅在原始状态确为 `04` 时显示自适应状态。
-- 蓝牙侧复用小米已有的 AirPods 传输通道，不另开第二条 AAP 连接，避免和原厂会话争用。
+- HyperOS 4 设置页通过 Qigsaw 动态加载。模块在 `JavaActivity` 进入 `onCreate` 时取得 split ClassLoader，Hook 插件自身的 Fragment/`AncController` 生命周期：功能开关在 Preference XML 创建后加入，自适应按钮在原生 `initView()` 完成后同帧加入，不依赖固定延时。
+- “对话感知”和“睡眠检测”位于原生 `profile_container`（通话音频卡片）之前，并放在同一个无内部间隔的 Preference 分组中。
+- HyperOS 4 控制中心由 `com.miui.circulateplus.world.headset.r` 管理。模块把第四个 `AncModeConfig` 注入原生列表，继续由系统的 `HeadsetSelectCardView.a()` 创建和布局，不手动 inflate 或 addView；通透图标复用系统 `headset_transparency_selector` 资源。
+- HyperOS 3 控制中心保留旧的原生数组兼容路径。两套路径都只替换自适应的最终指令，其他三种模式继续使用系统原生处理。
+- 蓝牙侧复用小米已有的 AirPods 传输通道，不另开第二条 AAP 连接，避免和原厂会话争用。自适应状态使用 pending/confirmed 状态机，并在 AAP 会话重建时重新发送扩展能力初始化包。
 
 ## 已知限制
 
-- 这是针对当前 HyperOS 3 实现编写的版本，系统更新后混淆类名或动态插件资源可能变化。
+- 系统更新后混淆类名或动态插件资源可能变化；HyperOS 3 与 HyperOS 4 使用不同的蓝牙实现，模块会按运行时类名选择对应路径。
 - 自适应图标暂时使用原厂通透图标，后续会优先寻找并复用小米官方资源。
 - 设置页和控制中心的具体布局可能因设备尺寸、语言或系统插件版本而不同。
 - 尚未覆盖所有 AirPods/Beats 型号，也未完成长期稳定性测试。
