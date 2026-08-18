@@ -4,14 +4,26 @@ import android.bluetooth.BluetoothDevice
 import android.app.Activity
 import android.content.Context
 import android.content.ContentValues
+import android.content.res.Configuration
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ImageView
+import android.widget.SeekBar
 import android.widget.Toast
 import java.lang.reflect.Proxy
 import java.io.File
@@ -27,12 +39,58 @@ object ApplePodsSettingsHook : HookContext() {
     private const val PREF_SLEEP = "applepods_sleep_detection"
     private const val PREF_FEATURE_CATEGORY = "applepods_airpods_features"
     private const val PREF_PROFILE_CATEGORY = "profile_container"
+    private const val ADAPTIVE_SLIDER_TAG = "applepods_settings_adaptive_noise_slider"
+    private const val ADAPTIVE_NOISE_CONFIRM_DELAY_MS = 5_000L
+    private const val ADAPTIVE_NOISE_CONFIRM_RETRY_DELAY_MS = 5_000L
+    private const val ADAPTIVE_NOISE_CONFIRM_WINDOW_MS = 10_500L
     private val adaptiveItems = WeakHashMap<Any, AdaptiveModeItem>()
     private val observedFragments = WeakHashMap<Any, Boolean>()
     private val nativeAncItems = WeakHashMap<Any, NativeAncItem>()
+    private val nativeAdaptiveSliders = WeakHashMap<Any, NativeAdaptiveSlider>()
     private val hookedPluginLoaders = WeakHashMap<ClassLoader, Boolean>()
     private var ancControllerHooksInstalled = false
     private var resourceStackLogged = false
+
+    /** MIUI X thumb handling with the centered adaptive-strength track used in Control Center. */
+    private class SettingsAdaptiveSeekBar(
+        context: Context,
+        trackColor: Int,
+        activeColor: Int,
+    ) : SeekBar(context) {
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = trackColor }
+        private val activePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = activeColor }
+
+        init {
+            progressDrawable = ColorDrawable(Color.TRANSPARENT)
+        }
+
+        fun alignThumbToTrackEdges() {
+            setPadding(0, paddingTop, 0, paddingBottom)
+            thumbOffset = 0
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val width = width.toFloat()
+            if (width > 0f) {
+                val trackHeight = 20f * resources.displayMetrics.density
+                val top = (height - trackHeight) / 2f
+                val radius = trackHeight / 2f
+                val center = width / 2f
+                val fraction = if (max > 0) progress.toFloat() / max else 0.5f
+                val thumbCenter = width * fraction
+                canvas.drawRoundRect(0f, top, width, top + trackHeight, radius, radius, trackPaint)
+                when {
+                    fraction < 0.5f -> canvas.drawRoundRect(
+                        thumbCenter, top, center, top + trackHeight, radius, radius, activePaint,
+                    )
+                    fraction > 0.5f -> canvas.drawRoundRect(
+                        center, top, thumbCenter, top + trackHeight, radius, radius, activePaint,
+                    )
+                }
+            }
+            super.onDraw(canvas)
+        }
+    }
 
     override fun onHook() {
         // JavaActivity is the entry point of the Qigsaw split. At Activity.onCreate entry its
@@ -244,6 +302,7 @@ object ApplePodsSettingsHook : HookContext() {
         }
         val current = getObjectField(controller, "mCurrentAnc") as? Int ?: 0
         renderNativeAnc(item, current == ApplePodsAapProtocol.MODE_ADAPTIVE)
+        installNativeAdaptiveSlider(fragment, root, controller, parent, current)
         Log.i(TAG, "adaptive mode attached to native AncController")
     }
 
@@ -285,6 +344,7 @@ object ApplePodsSettingsHook : HookContext() {
                         }
                     }
                     renderNativeAnc(it, adaptive)
+                    nativeAdaptiveSliders[controller]?.setAdaptiveSelected(adaptive)
                 }
             }
             ancControllerHooksInstalled = true
@@ -310,6 +370,240 @@ object ApplePodsSettingsHook : HookContext() {
         if (drawable != 0) item.image?.setImageResource(drawable)
         val color = if (selected) item.colorOn else item.colorOff
         if (color != 0) item.text?.setTextColor(item.wrapper.context.getColor(color))
+    }
+
+    /** Places adaptive strength under the four mode buttons, inside their existing CardView. */
+    private fun installNativeAdaptiveSlider(
+        fragment: Any,
+        root: View,
+        controller: Any,
+        buttonRow: LinearLayout,
+        currentMode: Int,
+    ) {
+        if (nativeAdaptiveSliders.containsKey(controller)) return
+        val card = buttonRow.parent as? ViewGroup ?: return
+        val context = root.context
+        val device = getObjectField(fragment, "mDevice") as? BluetoothDevice ?: return
+
+        val vertical = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            tag = ADAPTIVE_SLIDER_TAG
+        }
+        val cardChildParams = buttonRow.layoutParams
+        card.removeView(buttonRow)
+        card.addView(vertical, cardChildParams)
+        vertical.addView(buttonRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            if (cardChildParams is ViewGroup.MarginLayoutParams) {
+                setMargins(
+                    cardChildParams.leftMargin,
+                    cardChildParams.topMargin,
+                    cardChildParams.rightMargin,
+                    cardChildParams.bottomMargin,
+                )
+            }
+        })
+
+        val night = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+            Configuration.UI_MODE_NIGHT_YES
+        val blueName = if (night) {
+            "miuix_color_blue_dark_primary_default"
+        } else {
+            "miuix_color_blue_light_primary_default"
+        }
+        val blue = pluginColor(fragment, root, blueName, if (night) 0xFF277AF7.toInt() else 0xFF3482FF.toInt())
+        val gray = pluginColor(fragment, root, "device_settings_noise_reduction_seekbar_bg", 0xFF2F2E32.toInt())
+        val dotColor = pluginColor(fragment, root, "device_settings_noise_reduction_seekbar_dot", 0xFF8C93B0.toInt())
+
+        val slider = SettingsAdaptiveSeekBar(context, gray, blue).apply {
+            max = 100
+            contentDescription = AdaptiveModeItem.localized(context, "自适应强度", "Adaptive strength")
+        }
+        val initialLevel = HyperOsAirPodsRepository.getState(
+            context,
+            device,
+            HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE,
+        )?.toIntOrNull()?.coerceIn(0, 100) ?: 50
+        slider.progress = initialLevel
+        val thumbName = if (night) {
+            "miuix_appcompat_default_seekbar_thumb_dark"
+        } else {
+            "miuix_appcompat_default_seekbar_thumb_light"
+        }
+        pluginResource(fragment, root, "drawable", thumbName).takeIf { it != 0 }?.let { thumbId ->
+            context.getDrawable(thumbId)?.let { slider.thumb = withoutMiuixThumbInset(it) }
+        }
+        slider.alignThumbToTrackEdges()
+
+        val scale = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        val transparencyIcon = ImageView(context).apply {
+            pluginResource(fragment, root, "drawable", "transparent_off").takeIf { it != 0 }
+                ?.let(::setImageResource)
+            contentDescription = AdaptiveModeItem.localized(context, "通透", "Transparency")
+        }
+        val noiseIcon = ImageView(context).apply {
+            pluginResource(fragment, root, "drawable", "openanc_off").takeIf { it != 0 }
+                ?.let(::setImageResource)
+            contentDescription = AdaptiveModeItem.localized(context, "降噪", "Noise cancellation")
+        }
+        val iconSize = dp(context, 20)
+        scale.addView(FrameLayout(context).apply {
+            addView(transparencyIcon, FrameLayout.LayoutParams(iconSize, iconSize).apply {
+                gravity = android.view.Gravity.START
+            })
+        }, LinearLayout.LayoutParams(0, iconSize, 1f))
+        scale.addView(View(context).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(dotColor)
+            }
+        }, LinearLayout.LayoutParams(dp(context, 6), dp(context, 6)).apply {
+            gravity = android.view.Gravity.CENTER
+        })
+        scale.addView(FrameLayout(context).apply {
+            addView(noiseIcon, FrameLayout.LayoutParams(iconSize, iconSize).apply {
+                gravity = android.view.Gravity.END
+            })
+        }, LinearLayout.LayoutParams(0, iconSize, 1f))
+
+        val sliderBlock = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(slider, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(context, 32),
+            ))
+            addView(scale, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(context, 4) })
+        }
+        vertical.addView(sliderBlock, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            leftMargin = dp(context, 26)
+            rightMargin = dp(context, 26)
+            topMargin = dp(context, 4)
+            bottomMargin = dp(context, 17)
+        })
+
+        var dragging = false
+        var lastSentLevel = initialLevel
+        var pendingLevel: Int? = null
+        var pendingUntil = 0L
+        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) = Unit
+
+            override fun onStartTrackingTouch(bar: SeekBar) {
+                dragging = true
+            }
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                dragging = false
+                val level = bar.progress.coerceIn(0, 100)
+                if (level == lastSentLevel) return
+                if (!HyperOsAirPodsRepository.sendAdaptiveAudioNoise(context, device, level)) {
+                    showSendFailed(slider)
+                    return
+                }
+                lastSentLevel = level
+                pendingLevel = level
+                pendingUntil = System.currentTimeMillis() + ADAPTIVE_NOISE_CONFIRM_WINDOW_MS
+                verifyAdaptiveNoiseWrite(
+                    context,
+                    device,
+                    level,
+                    onConfirmed = {
+                        pendingLevel = null
+                        pendingUntil = 0L
+                    },
+                    onRejected = {
+                        pendingLevel = null
+                        pendingUntil = 0L
+                    },
+                )
+            }
+        })
+        HyperOsAirPodsRepository.observe(sliderBlock, device) { key, value ->
+            if (key != HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE || dragging) return@observe
+            value.toIntOrNull()?.coerceIn(0, 100)?.let { level ->
+                val pending = pendingLevel
+                if (pending != null) {
+                    if (level == pending) {
+                        pendingLevel = null
+                        pendingUntil = 0L
+                    } else if (System.currentTimeMillis() < pendingUntil) {
+                        return@observe
+                    } else {
+                        pendingLevel = null
+                    }
+                }
+                slider.progress = level
+                lastSentLevel = level
+            }
+        }
+
+        nativeAdaptiveSliders[controller] = NativeAdaptiveSlider(sliderBlock)
+        nativeAdaptiveSliders[controller]?.setAdaptiveSelected(
+            currentMode == ApplePodsAapProtocol.MODE_ADAPTIVE,
+        )
+        Log.i(TAG, "adaptive strength inserted inside native ANC card")
+    }
+
+    private fun pluginColor(fragment: Any, root: View, name: String, fallback: Int): Int {
+        val id = pluginResource(fragment, root, "color", name)
+        return if (id == 0) fallback else runCatching { root.context.getColor(id) }.getOrDefault(fallback)
+    }
+
+    private fun withoutMiuixThumbInset(drawable: Drawable): Drawable =
+        ((drawable as? LayerDrawable)?.getDrawable(0) ?: drawable).mutate()
+
+    private fun dp(context: Context, value: Int): Int =
+        (value * context.resources.displayMetrics.density).toInt()
+
+    /** Delayed confirmation and one retry for adaptive-noise AAP writes. */
+    private fun verifyAdaptiveNoiseWrite(
+        context: Context,
+        device: BluetoothDevice,
+        expected: Int,
+        onConfirmed: () -> Unit,
+        onRejected: () -> Unit,
+    ) {
+        Handler(Looper.getMainLooper()).postDelayed({
+            val reported = HyperOsAirPodsRepository.getState(
+                context,
+                device,
+                HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE,
+            )?.toIntOrNull()
+            if (reported == expected) {
+                onConfirmed()
+                return@postDelayed
+            }
+            if (HyperOsAirPodsRepository.getState(
+                    context,
+                    device,
+                    HyperOsAirPodsRepository.KEY_ANC,
+                )?.trimStart('0') != ApplePodsAapProtocol.MODE_ADAPTIVE.toString()
+            ) return@postDelayed
+            if (!HyperOsAirPodsRepository.sendAdaptiveAudioNoise(context, device, expected)) {
+                onRejected()
+                return@postDelayed
+            }
+            Handler(Looper.getMainLooper()).postDelayed({
+                val retried = HyperOsAirPodsRepository.getState(
+                    context,
+                    device,
+                    HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE,
+                )?.toIntOrNull()
+                if (retried == expected) onConfirmed() else onRejected()
+            }, ADAPTIVE_NOISE_CONFIRM_RETRY_DELAY_MS)
+        }, ADAPTIVE_NOISE_CONFIRM_DELAY_MS)
     }
 
     /** Dynamic Settings plugins use their own relocated resource package. */
@@ -353,6 +647,12 @@ object ApplePodsSettingsHook : HookContext() {
         val colorOn: Int,
         val colorOff: Int,
     )
+
+    private data class NativeAdaptiveSlider(val container: View) {
+        fun setAdaptiveSelected(selected: Boolean) {
+            container.visibility = if (selected) View.VISIBLE else View.GONE
+        }
+    }
 
     private fun findBluetoothDevice(bundle: Bundle?, depth: Int = 0): BluetoothDevice? {
         if (bundle == null || depth > 2) return null
