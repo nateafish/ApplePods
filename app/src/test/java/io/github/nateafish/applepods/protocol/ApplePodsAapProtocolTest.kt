@@ -43,6 +43,17 @@ class ApplePodsAapProtocolTest {
     }
 
     @Test
+    fun adaptiveAudioNoiseUsesCapodInvertedWireValue() {
+        assertArrayEquals(
+            byteArrayOf(0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x2E, 0x14, 0x00, 0x00, 0x00),
+            ApplePodsAapProtocol.adaptiveAudioNoise(80),
+        )
+        assertEquals(80, ApplePodsAapProtocol.decodeAdaptiveAudioNoise(0x14))
+        assertEquals(0, ApplePodsAapProtocol.decodeAdaptiveAudioNoise(0x64))
+        assertEquals(100, ApplePodsAapProtocol.decodeAdaptiveAudioNoise(0x00))
+    }
+
+    @Test
     fun parsesSeveralControlFramesFromOneRead() {
         val first = ApplePodsAapProtocol.booleanControl(
             ApplePodsAapProtocol.ID_CONVERSATION_AWARENESS,

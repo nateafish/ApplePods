@@ -18,6 +18,7 @@ object HyperOsAirPodsRepository {
     )
 
     const val KEY_ANC = "air_anc"
+    const val KEY_ADAPTIVE_AUDIO_NOISE = "applepods_adaptive_audio_noise"
     const val KEY_CONVERSATION_AWARENESS = "applepods_conversation_awareness"
     const val KEY_SLEEP_DETECTION = "applepods_sleep_detection"
 
@@ -45,6 +46,29 @@ object HyperOsAirPodsRepository {
         return sent
     }
 
+    fun sendAdaptiveAudioNoise(context: Context, device: BluetoothDevice, level: Int): Boolean {
+        val value = level.coerceIn(0, 100).toString()
+        val sent = sendCommand(context, device, KEY_ADAPTIVE_AUDIO_NOISE, value)
+        if (sent) {
+            // CAPod updates AapPodState optimistically before verification. This matters for
+            // devices such as Pro 3 that accept 0x2E but may not echo it: rebuilding the MiLink
+            // panel must read the last accepted value instead of falling back to neutral (50).
+            // Store it silently so the UI's pending window is not mistaken for a real device
+            // acknowledgement; an incoming 0x2E still publishes the authoritative notification.
+            setState(context, device, KEY_ADAPTIVE_AUDIO_NOISE, value)
+        }
+        return sent
+    }
+
+    private fun setState(
+        context: Context,
+        device: BluetoothDevice,
+        key: String,
+        value: String,
+    ) {
+        call(context, "set_state", key, value, device)
+    }
+
     /** Publishes a state decoded directly from an incoming AAP frame. */
     fun setStateAndNotify(
         context: Context,
@@ -52,7 +76,7 @@ object HyperOsAirPodsRepository {
         key: String,
         value: String,
     ) {
-        call(context, "set_state", key, value, device)
+        setState(context, device, key, value)
         notifyStateChanged(context, device, key, value)
     }
 

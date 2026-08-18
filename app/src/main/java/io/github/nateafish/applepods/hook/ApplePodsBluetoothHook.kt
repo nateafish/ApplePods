@@ -56,6 +56,17 @@ object ApplePodsBluetoothHook : HookContext() {
             val device = extras.getParcelable(
                 "android.bluetooth.device.extra.DEVICE", BluetoothDevice::class.java,
             ) ?: return@hookBefore
+            if (key == HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE) {
+                val level = value.toIntOrNull()?.coerceIn(0, 100) ?: return@hookBefore
+                val sent = sendThroughOemTransport(
+                    device,
+                    ApplePodsAapProtocol.adaptiveAudioNoise(level),
+                )
+                extras.putInt("extra_command_state", if (sent) 1 else 0)
+                result = extras
+                Log.i(TAG, "adaptive audio noise level=$level sent=$sent device=${device.address}")
+                return@hookBefore
+            }
             if (key == HyperOsAirPodsRepository.KEY_ANC) {
                 AdaptiveStateTracker.explicitMode(
                     device.address, value.trimStart('0').toIntOrNull() ?: return@hookBefore,
@@ -146,6 +157,8 @@ object ApplePodsBluetoothHook : HookContext() {
                 ) return@forEach
                 val key = when (state.identifier) {
                     ApplePodsAapProtocol.ID_LISTENING_MODE -> HyperOsAirPodsRepository.KEY_ANC
+                    ApplePodsAapProtocol.ID_AUTO_ANC_STRENGTH ->
+                        HyperOsAirPodsRepository.KEY_ADAPTIVE_AUDIO_NOISE
                     ApplePodsAapProtocol.ID_CONVERSATION_AWARENESS ->
                         HyperOsAirPodsRepository.KEY_CONVERSATION_AWARENESS
                     ApplePodsAapProtocol.ID_SLEEP_DETECTION ->
@@ -154,6 +167,8 @@ object ApplePodsBluetoothHook : HookContext() {
                 }
                 val value = if (state.identifier == ApplePodsAapProtocol.ID_LISTENING_MODE) {
                     rawValue.toString().padStart(2, '0')
+                } else if (state.identifier == ApplePodsAapProtocol.ID_AUTO_ANC_STRENGTH) {
+                    ApplePodsAapProtocol.decodeAdaptiveAudioNoise(rawValue).toString()
                 } else rawValue.toString()
                 HyperOsAirPodsRepository.setStateAndNotify(context, device, key, value)
                 Log.i(TAG, "live AAP state key=$key value=$value device=${device.address}")
