@@ -62,6 +62,11 @@ object ApplePodsSettingsHook : HookContext() {
 
         init {
             progressDrawable = ColorDrawable(Color.TRANSPARENT)
+            // The themed platform SeekBar installs a RippleDrawable as its background. It can be
+            // activated by the surrounding OEM card and renders a gray halo around the thumb.
+            // This custom control intentionally uses a static thumb with no press ripple.
+            background = null
+            isDuplicateParentStateEnabled = false
         }
 
         fun alignThumbToTrackEdges() {
