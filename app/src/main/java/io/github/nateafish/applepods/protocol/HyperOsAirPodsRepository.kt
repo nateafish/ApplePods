@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.protocol
+package io.github.nateafish.applepods.protocol
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter

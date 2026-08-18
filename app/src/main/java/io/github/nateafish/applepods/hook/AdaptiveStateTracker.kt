@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.hook
+package io.github.nateafish.applepods.hook
 
 import java.util.concurrent.ConcurrentHashMap
 
@@ -17,7 +17,7 @@ object AdaptiveStateTracker {
     }
 
     fun explicitMode(address: String, mode: Int) {
-        if (mode == io.github.nathanxie.applepods.protocol.ApplePodsAapProtocol.MODE_ADAPTIVE) {
+        if (mode == io.github.nateafish.applepods.protocol.ApplePodsAapProtocol.MODE_ADAPTIVE) {
             requested(address)
         } else {
             states.remove(address)

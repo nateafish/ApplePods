@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods
+package io.github.nateafish.applepods
 
 import android.app.Application
 import io.github.libxposed.service.XposedService

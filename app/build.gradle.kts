@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "io.github.nathanxie.applepods"
+    namespace = "io.github.nateafish.applepods"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.nathanxie.applepods"
+        applicationId = "io.github.nateafish.applepods"
         minSdk = 35
         targetSdk = 36
         versionCode = 2
