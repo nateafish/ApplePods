@@ -391,7 +391,12 @@ object ApplePodsSettingsHook : HookContext() {
         }
         val cardChildParams = buttonRow.layoutParams
         card.removeView(buttonRow)
-        card.addView(vertical, cardChildParams)
+        // The original row's 17.49dp top margin belonged inside the CardView. Reusing those
+        // params on this new wrapper and then adding row padding would apply that margin twice.
+        card.addView(vertical, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
         vertical.addView(buttonRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -399,9 +404,9 @@ object ApplePodsSettingsHook : HookContext() {
             if (cardChildParams is ViewGroup.MarginLayoutParams) {
                 setMargins(
                     cardChildParams.leftMargin,
-                    cardChildParams.topMargin,
+                    dp(context, 17.5f),
                     cardChildParams.rightMargin,
-                    cardChildParams.bottomMargin,
+                    0,
                 )
             }
         })
@@ -414,8 +419,19 @@ object ApplePodsSettingsHook : HookContext() {
             "miuix_color_blue_light_primary_default"
         }
         val blue = pluginColor(fragment, root, blueName, if (night) 0xFF277AF7.toInt() else 0xFF3482FF.toInt())
-        val gray = pluginColor(fragment, root, "device_settings_noise_reduction_seekbar_bg", 0xFF2F2E32.toInt())
+        val trackName = if (night) {
+            "miuix_appcompat_progress_background_dark"
+        } else {
+            "miuix_appcompat_progress_background_light"
+        }
+        val gray = pluginColor(
+            fragment,
+            root,
+            trackName,
+            if (night) 0x33FFFFFF else 0x1A597098,
+        )
         val dotColor = pluginColor(fragment, root, "device_settings_noise_reduction_seekbar_dot", 0xFF8C93B0.toInt())
+        val iconColor = if (night) 0xB3FFFFFF.toInt() else 0x99000000.toInt()
 
         val slider = SettingsAdaptiveSeekBar(context, gray, blue).apply {
             max = 100
@@ -442,13 +458,19 @@ object ApplePodsSettingsHook : HookContext() {
             gravity = android.view.Gravity.CENTER_VERTICAL
         }
         val transparencyIcon = ImageView(context).apply {
-            pluginResource(fragment, root, "drawable", "transparent_off").takeIf { it != 0 }
-                ?.let(::setImageResource)
+            setImageDrawable(moduleDrawable(
+                context,
+                io.github.nateafish.applepods.R.drawable.applepods_headset_transparency,
+                iconColor,
+            ))
             contentDescription = AdaptiveModeItem.localized(context, "通透", "Transparency")
         }
         val noiseIcon = ImageView(context).apply {
-            pluginResource(fragment, root, "drawable", "openanc_off").takeIf { it != 0 }
-                ?.let(::setImageResource)
+            setImageDrawable(moduleDrawable(
+                context,
+                io.github.nateafish.applepods.R.drawable.applepods_headset_noise_cancel,
+                iconColor,
+            ))
             contentDescription = AdaptiveModeItem.localized(context, "降噪", "Noise cancellation")
         }
         val iconSize = dp(context, 20)
@@ -489,8 +511,8 @@ object ApplePodsSettingsHook : HookContext() {
         ).apply {
             leftMargin = dp(context, 26)
             rightMargin = dp(context, 26)
-            topMargin = dp(context, 4)
-            bottomMargin = dp(context, 17)
+            topMargin = 0
+            bottomMargin = dp(context, 17.5f)
         })
 
         var dragging = false
@@ -561,10 +583,23 @@ object ApplePodsSettingsHook : HookContext() {
         return if (id == 0) fallback else runCatching { root.context.getColor(id) }.getOrDefault(fallback)
     }
 
+    private fun moduleDrawable(context: Context, drawableId: Int, tint: Int): Drawable? =
+        runCatching {
+            context.createPackageContext(
+                "io.github.nateafish.applepods",
+                Context.CONTEXT_IGNORE_SECURITY,
+            ).getDrawable(drawableId)?.mutate()?.apply { setTint(tint) }
+        }.onFailure {
+            Log.e(TAG, "module adaptive icon unavailable", it)
+        }.getOrNull()
+
     private fun withoutMiuixThumbInset(drawable: Drawable): Drawable =
         ((drawable as? LayerDrawable)?.getDrawable(0) ?: drawable).mutate()
 
     private fun dp(context: Context, value: Int): Int =
+        (value * context.resources.displayMetrics.density).toInt()
+
+    private fun dp(context: Context, value: Float): Int =
         (value * context.resources.displayMetrics.density).toInt()
 
     /** Delayed confirmation and one retry for adaptive-noise AAP writes. */
