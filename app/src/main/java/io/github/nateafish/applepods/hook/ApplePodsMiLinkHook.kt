@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.hook
+package io.github.nateafish.applepods.hook
 
 import android.view.LayoutInflater
 import android.view.View
@@ -6,8 +6,8 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import io.github.nathanxie.applepods.protocol.ApplePodsAapProtocol
-import io.github.nathanxie.applepods.protocol.HyperOsAirPodsRepository
+import io.github.nateafish.applepods.protocol.ApplePodsAapProtocol
+import io.github.nateafish.applepods.protocol.HyperOsAirPodsRepository
 import java.util.concurrent.ConcurrentHashMap
 import java.util.WeakHashMap
 

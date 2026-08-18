@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.hook
+package io.github.nateafish.applepods.hook
 
 import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
@@ -9,8 +9,8 @@ import android.os.Looper
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
-import io.github.nathanxie.applepods.protocol.ApplePodsAapProtocol
-import io.github.nathanxie.applepods.protocol.HyperOsAirPodsRepository
+import io.github.nateafish.applepods.protocol.ApplePodsAapProtocol
+import io.github.nateafish.applepods.protocol.HyperOsAirPodsRepository
 
 /** Adds only the two AAP commands missing from HyperOS' own AirPods repository. */
 object ApplePodsBluetoothHook : HookContext() {

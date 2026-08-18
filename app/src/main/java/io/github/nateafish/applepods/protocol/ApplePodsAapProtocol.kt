@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.protocol
+package io.github.nateafish.applepods.protocol
 
 /** Small, testable AAP control-command codec used by the HyperOS hooks. */
 object ApplePodsAapProtocol {

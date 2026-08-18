@@ -59,7 +59,7 @@ Debug APK 输出位置：
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-当前版本号为 `0.2.0-alpha01`，包名为 `io.github.nathanxie.applepods`。
+当前版本号为 `0.2.0-alpha01`，包名为 `io.github.nateafish.applepods`。
 
 ## 实现说明
 

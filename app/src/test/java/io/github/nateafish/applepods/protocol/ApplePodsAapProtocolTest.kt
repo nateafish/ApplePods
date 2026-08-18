@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.protocol
+package io.github.nateafish.applepods.protocol
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals

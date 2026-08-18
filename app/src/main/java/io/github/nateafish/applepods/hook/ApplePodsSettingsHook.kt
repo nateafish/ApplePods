@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods.hook
+package io.github.nateafish.applepods.hook
 
 import android.bluetooth.BluetoothDevice
 import android.app.Activity
@@ -16,8 +16,8 @@ import android.widget.Toast
 import java.lang.reflect.Proxy
 import java.io.File
 import java.util.WeakHashMap
-import io.github.nathanxie.applepods.protocol.ApplePodsAapProtocol
-import io.github.nathanxie.applepods.protocol.HyperOsAirPodsRepository
+import io.github.nateafish.applepods.protocol.ApplePodsAapProtocol
+import io.github.nateafish.applepods.protocol.HyperOsAirPodsRepository
 
 /** Lightly augments HyperOS' existing AirPods detail page; it does not replace the page. */
 object ApplePodsSettingsHook : HookContext() {

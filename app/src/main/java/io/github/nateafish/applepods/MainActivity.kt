@@ -1,4 +1,4 @@
-package io.github.nathanxie.applepods
+package io.github.nateafish.applepods
 
 import android.app.Activity
 import android.graphics.Color
