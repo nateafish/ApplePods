@@ -25,13 +25,26 @@ object ApplePodsSettingsHook : HookContext() {
     private const val ADAPTIVE_TAG = "applepods_adaptive_mode"
     private const val PREF_CONVERSATION = "applepods_conversation_awareness"
     private const val PREF_SLEEP = "applepods_sleep_detection"
+    private const val PREF_FEATURE_CATEGORY = "applepods_airpods_features"
+    private const val PREF_PROFILE_CATEGORY = "profile_container"
     private val adaptiveItems = WeakHashMap<Any, AdaptiveModeItem>()
     private val observedFragments = WeakHashMap<Any, Boolean>()
     private val nativeAncItems = WeakHashMap<Any, NativeAncItem>()
+    private val hookedPluginLoaders = WeakHashMap<ClassLoader, Boolean>()
     private var ancControllerHooksInstalled = false
     private var resourceStackLogged = false
 
     override fun onHook() {
+        // JavaActivity is the entry point of the Qigsaw split. At Activity.onCreate entry its
+        // split ClassLoader already exists, but the AirPods fragment has not started its own
+        // lifecycle yet. Install the plugin-local hooks at that exact point.
+        hookBefore(Activity::class.java.getDeclaredMethod(
+            "onCreate", Bundle::class.java,
+        ).apply { isAccessible = true }) {
+            val activity = instance as? Activity ?: return@hookBefore
+            if (activity.javaClass.name != "plugin.settings.java.JavaActivity") return@hookBefore
+            installPluginLifecycleHooks(activity.javaClass.classLoader ?: return@hookBefore)
+        }
         runCatching {
             val fragmentClass = findClass("com.android.settings.bluetooth.MiuiHeadsetFragment")
             hookAfter(
@@ -57,7 +70,7 @@ object ApplePodsSettingsHook : HookContext() {
                 // Reaching MiuiHeadsetFragment with an mDevice is the OEM's own support decision.
                 // Its provider-side ConnectL2cap probe is not reliable from the Settings process.
                 Log.i(TAG, "injecting device=${device.name} address=${device.address}")
-                installFeaturePreferences(fragment, root, device)
+                installFeaturePreferences(fragment, root.context, device)
                 HyperOsAirPodsRepository.observe(root, device) { key, value ->
                     when (key) {
                         HyperOsAirPodsRepository.KEY_ANC ->
@@ -95,35 +108,64 @@ object ApplePodsSettingsHook : HookContext() {
                 val activity = instance as? Activity ?: return@hookAfter
                 if (activity.javaClass.name != "plugin.settings.java.JavaActivity") return@hookAfter
                 Log.i(TAG, "plugin JavaActivity resumed")
-                activity.window.decorView.post {
-                    injectFromPluginActivity(activity)
-                    activity.window.decorView.postDelayed({ injectFromPluginActivity(activity) }, 500L)
-                }
+                // HyperOS 3 fallback. HyperOS 4 normally finishes through the plugin lifecycle
+                // hooks installed before JavaActivity.onCreate.
+                injectFromPluginActivity(activity)
             }
             Log.i(TAG, "MiuiHeadsetFragment light injection installed")
         }.onFailure { Log.e(TAG, "MiuiHeadsetFragment hook unavailable", it) }
     }
 
+    private fun installPluginLifecycleHooks(loader: ClassLoader) {
+        synchronized(hookedPluginLoaders) {
+            if (hookedPluginLoaders.put(loader, true) == true) return
+        }
+        runCatching {
+            val fragmentClass = Class.forName(
+                "plugin.settings.java.airpods.MiuiAirpodsFragment", false, loader,
+            )
+            hookAfter(fragmentClass.getDeclaredMethod("onCreate", Bundle::class.java)) {
+                val fragment = instance ?: return@hookAfter
+                val activity = callMethod(fragment, "getActivity") as? Activity ?: return@hookAfter
+                val device = getObjectField(fragment, "mDevice") as? BluetoothDevice ?: return@hookAfter
+                installFeaturePreferences(fragment, activity, device)
+                Log.i(TAG, "Qigsaw preference injection completed during fragment onCreate")
+            }
+            val controllerClass = Class.forName(
+                "plugin.settings.java.airpods.AncController", false, loader,
+            )
+            val initAncView = controllerClass.declaredMethods.firstOrNull {
+                it.parameterTypes.contentEquals(arrayOf(View::class.java)) &&
+                    it.name.contains("lambda") && it.name.contains("new")
+            } ?: throw NoSuchMethodException("AncController native initView callback")
+            initAncView.isAccessible = true
+            hookAfter(initAncView) {
+                val controller = instance ?: return@hookAfter
+                val activity = getObjectField(controller, "mActivity") as? Activity ?: return@hookAfter
+                val fragment = findHeadsetFragment(activity) ?: return@hookAfter
+                val root = args.firstOrNull() as? View ?: return@hookAfter
+                val device = getObjectField(fragment, "mDevice") as? BluetoothDevice ?: return@hookAfter
+                installNativeAncExtension(fragment, root)
+                ensureLiveState(fragment, root, device)
+                Log.i(TAG, "Qigsaw native ANC injection completed after controller initView")
+            }
+            Log.i(TAG, "Qigsaw AirPods fragment lifecycle hooks installed")
+        }.onFailure {
+            synchronized(hookedPluginLoaders) { hookedPluginLoaders.remove(loader) }
+            Log.e(TAG, "Qigsaw AirPods fragment lifecycle hook unavailable", it)
+        }
+    }
+
     private fun injectFromPluginActivity(activity: Activity) {
         val extras = activity.intent?.extras
-        Log.i(TAG, "plugin extras=${extras?.keySet()?.joinToString { key ->
-            "$key:${runCatching { extras.get(key)?.javaClass?.name }.getOrNull()}"
-        }}")
         val device = findBluetoothDevice(extras)
             ?: HyperOsAirPodsRepository.connectedAirPods(activity)
-            ?: run {
-            Log.i(TAG, "plugin injection skipped: connected AirPods unavailable")
-            return
-        }
+            ?: return
         val root = activity.window.decorView
+        val fragment = findHeadsetFragment(activity) ?: return
         logOemResourceStack(root)
-        val fragment = findHeadsetFragment(activity) ?: run {
-            Log.i(TAG, "plugin fragment not found; injecting adaptive from decor")
-            return
-        }
-        Log.i(TAG, "plugin fragment resolved: ${fragment.javaClass.name}")
         installNativeAncExtension(fragment, root)
-        installFeaturePreferences(fragment, root, device)
+        installFeaturePreferences(fragment, root.context, device)
         ensureLiveState(fragment, root, device)
     }
 
@@ -179,10 +221,26 @@ object ApplePodsSettingsHook : HookContext() {
         )
         nativeAncItems[controller] = item
         wrapper.setOnClickListener {
-            controller.javaClass.getMethod("setAncForUser", Int::class.javaPrimitiveType).invoke(
-                controller,
-                ApplePodsAapProtocol.MODE_ADAPTIVE,
-            )
+            val context = it.context
+            val device = runCatching { getObjectField(fragment, "mDevice") as? BluetoothDevice }
+                .getOrNull() ?: return@setOnClickListener
+            val allowed = runCatching {
+                controller.javaClass.getMethod(
+                    "checkAncAccess",
+                    Context::class.java,
+                    BluetoothDevice::class.java,
+                    Int::class.javaPrimitiveType,
+                ).invoke(controller, context, device, ApplePodsAapProtocol.MODE_ADAPTIVE) as Boolean
+            }.getOrDefault(false)
+            if (!allowed) return@setOnClickListener
+            // The native setAncForUser path also requires JavaActivity's HFP proxy, which is
+            // populated after the view is created. Sending through the same OEM Repository used
+            // by the rest of the module makes the first tap work while preserving native wear
+            // access checks; selection still waits for the real 0x04 echo.
+            if (!HyperOsAirPodsRepository.sendAncMode(
+                    context, device, ApplePodsAapProtocol.MODE_ADAPTIVE,
+                )
+            ) showSendFailed(wrapper)
         }
         val current = getObjectField(controller, "mCurrentAnc") as? Int ?: 0
         renderNativeAnc(item, current == ApplePodsAapProtocol.MODE_ADAPTIVE)
@@ -344,7 +402,7 @@ object ApplePodsSettingsHook : HookContext() {
         }
         Log.i(TAG, "resume injecting device=${device.name} address=${device.address}")
         logOemResourceStack(root)
-        installFeaturePreferences(fragment, root, device)
+        installFeaturePreferences(fragment, root.context, device)
         ensureLiveState(fragment, root, device)
     }
 
@@ -487,47 +545,127 @@ object ApplePodsSettingsHook : HookContext() {
         }
     }
 
-    private fun installFeaturePreferences(fragment: Any, root: View, device: BluetoothDevice) {
+    private fun installFeaturePreferences(fragment: Any, context: Context, device: BluetoothDevice) {
         val screen = invokeExact(fragment, "getPreferenceScreen", emptyArray()) ?: run {
             Log.i(TAG, "feature switches skipped: preference screen unavailable")
             return
         }
         val preferenceClass = findClass("androidx.preference.Preference")
-        val findOrder = findPreferenceOrderByTitle(
-            screen,
-            AdaptiveModeItem.localized(root.context, "查找", "Find My"),
-        )
+        val featureCategory = getOrCreateFeatureCategory(screen, preferenceClass)
+        movePreferenceIntoCategory(screen, featureCategory, PREF_CONVERSATION, 0)
+        movePreferenceIntoCategory(screen, featureCategory, PREF_SLEEP, 1)
         if (invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), PREF_CONVERSATION) == null) {
-            invokeExact(screen, "addPreference", arrayOf(preferenceClass), featurePreference(
+            invokeExact(featureCategory, "addPreference", arrayOf(preferenceClass), featurePreference(
                 screen,
                 device,
                 PREF_CONVERSATION,
                 HyperOsAirPodsRepository.KEY_CONVERSATION_AWARENESS,
-                AdaptiveModeItem.localized(root.context, "对话感知", "Conversation Awareness"),
+                AdaptiveModeItem.localized(context, "对话感知", "Conversation Awareness"),
                 AdaptiveModeItem.localized(
-                    root.context,
+                    context,
                     "检测到你开口说话时自动降低媒体音量并增强人声",
                     "Lowers media and emphasizes voices when you start speaking",
                 ),
-                findOrder?.minus(2),
+                0,
             ))
         }
         if (invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), PREF_SLEEP) == null) {
-            invokeExact(screen, "addPreference", arrayOf(preferenceClass), featurePreference(
+            invokeExact(featureCategory, "addPreference", arrayOf(preferenceClass), featurePreference(
                 screen,
                 device,
                 PREF_SLEEP,
                 HyperOsAirPodsRepository.KEY_SLEEP_DETECTION,
-                AdaptiveModeItem.localized(root.context, "睡眠检测", "Sleep Detection"),
+                AdaptiveModeItem.localized(context, "睡眠检测", "Sleep Detection"),
                 AdaptiveModeItem.localized(
-                    root.context,
+                    context,
                     "佩戴耳机入睡后，由 AirPods 自动暂停播放",
                     "Lets AirPods pause playback after you fall asleep",
                 ),
-                findOrder?.minus(1),
+                1,
             ))
         }
-        Log.i(TAG, "conversation and sleep preferences installed")
+        Log.i(TAG, "conversation and sleep preferences grouped above call audio")
+    }
+
+    private fun getOrCreateFeatureCategory(
+        screen: Any,
+        preferenceClass: Class<*>,
+    ): Any {
+        invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), PREF_FEATURE_CATEGORY)?.let {
+            configureFeatureCategory(it)
+            return it
+        }
+        val profileCategory = invokeExact(
+            screen, "findPreference", arrayOf(CharSequence::class.java), PREF_PROFILE_CATEGORY,
+        )
+        val profileOrder = profileCategory?.let {
+            invokeExact(it, "getOrder", emptyArray()) as? Int
+        } ?: (Int.MAX_VALUE - 10)
+        val context = invokeExact(screen, "getContext", emptyArray()) as Context
+        val categoryClass = findClass("androidx.preference.PreferenceCategory")
+        val category = categoryClass.getConstructor(Context::class.java).newInstance(context)
+        runCatching {
+            // Respect the explicit order relative to the OEM call-audio category instead of
+            // appending this late-injected group after all existing preferences.
+            invokeExact(screen, "setOrderingAsAdded", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
+        // airpodslayout.xml uses consecutive top-level orders: switchConfig=2,
+        // profile_container=3, findConfig=4, actions=5. Make one deterministic slot before the
+        // native profile card instead of relying on when the late profile rows become visible.
+        if (profileCategory != null) {
+            val count = invokeExact(screen, "getPreferenceCount", emptyArray()) as Int
+            for (index in 0 until count) {
+                val child = invokeExact(
+                    screen, "getPreference", arrayOf(Int::class.javaPrimitiveType!!), index,
+                ) ?: continue
+                val order = invokeExact(child, "getOrder", emptyArray()) as? Int ?: continue
+                if (order >= profileOrder) {
+                    invokeExact(child, "setOrder", arrayOf(Int::class.javaPrimitiveType!!), order + 1)
+                }
+            }
+        }
+        invokeExact(category, "setKey", arrayOf(String::class.java), PREF_FEATURE_CATEGORY)
+        invokeExact(
+            category,
+            "setOrder",
+            arrayOf(Int::class.javaPrimitiveType!!),
+            profileOrder,
+        )
+        configureFeatureCategory(category)
+        invokeExact(screen, "addPreference", arrayOf(preferenceClass), category)
+        return category
+    }
+
+    private fun configureFeatureCategory(category: Any) {
+        // Xiaomi's Preference renderer uses this flag for the internal card divider. The
+        // fallback calls are harmless on older AndroidX plugin revisions.
+        runCatching {
+            invokeExact(category, "setOrderingAsAdded", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
+        runCatching {
+            invokeExact(category, "setDividerAllowedInside", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
+        runCatching {
+            invokeExact(category, "setDividerAllowedAbove", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+            invokeExact(category, "setDividerAllowedBelow", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
+    }
+
+    private fun movePreferenceIntoCategory(screen: Any, category: Any, key: String, order: Int) {
+        val preference = invokeExact(screen, "findPreference", arrayOf(CharSequence::class.java), key) ?: return
+        runCatching {
+            invokeExact(preference, "setOrder", arrayOf(Int::class.javaPrimitiveType!!), order)
+            invokeExact(preference, "setDividerAllowedAbove", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+            invokeExact(preference, "setDividerAllowedBelow", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
+        val parent = runCatching { invokeExact(preference, "getParent", emptyArray()) }.getOrNull()
+        if (parent === category) return
+        runCatching {
+            (parent ?: screen).let {
+                invokeExact(it, "removePreference", arrayOf(findClass("androidx.preference.Preference")), preference)
+            }
+        }
+        invokeExact(category, "addPreference", arrayOf(findClass("androidx.preference.Preference")), preference)
     }
 
     private fun featurePreference(
@@ -552,6 +690,10 @@ object ApplePodsSettingsHook : HookContext() {
             order ?: (Int.MAX_VALUE - if (preferenceKey == PREF_CONVERSATION) 1 else 0),
         )
         invokeExact(preference, "setPersistent", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        runCatching {
+            invokeExact(preference, "setDividerAllowedAbove", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+            invokeExact(preference, "setDividerAllowedBelow", arrayOf(Boolean::class.javaPrimitiveType!!), false)
+        }
         invokeExact(
             preference,
             "setChecked",
@@ -568,24 +710,6 @@ object ApplePodsSettingsHook : HookContext() {
         }
         invokeExact(preference, "setOnPreferenceChangeListener", arrayOf(listenerClass), listener)
         return preference
-    }
-
-    private fun findPreferenceOrderByTitle(screen: Any, expectedTitle: String): Int? {
-        val count = invokeExact(screen, "getPreferenceCount", emptyArray()) as? Int ?: return null
-        for (index in 0 until count) {
-            val preference = invokeExact(
-                screen,
-                "getPreference",
-                arrayOf(Int::class.javaPrimitiveType!!),
-                index,
-            ) ?: continue
-            val title = invokeExact(preference, "getTitle", emptyArray())?.toString() ?: continue
-            if (title == expectedTitle || title.contains(expectedTitle, ignoreCase = true)) {
-                return invokeExact(preference, "getOrder", emptyArray()) as? Int
-            }
-        }
-        Log.i(TAG, "Find My preference not found; using trailing fallback order")
-        return null
     }
 
     private fun findPreference(fragment: Any, key: String): Any? =
