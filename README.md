@@ -21,7 +21,7 @@ ApplePods 是一个当前主要适配 **HyperOS 4**、同时保留 **HyperOS 3**
 
 ### 自适应滑块独立状态
 
-自适应滑块不是 `01~04` 的听音模式状态，而是独立的自动降噪强度状态。它使用 AAP `0x2E`（`ID_AUTO_ANC_STRENGTH`）回报码同步，界面值范围为 `0~100`：
+自适应滑块使用 AAP `0x2E`（`ID_AUTO_ANC_STRENGTH`）回报码同步，界面值范围为 `0~100`：
 
 - 数值越大，表示增强的环境声越多。
 - 耳机回报码与界面值采用反向映射：界面值 = `100 -` 耳机回报码。
@@ -33,7 +33,7 @@ ApplePods 是一个当前主要适配 **HyperOS 4**、同时保留 **HyperOS 3**
 - HyperOS 3（保留兼容路径，验证覆盖低于 HyperOS 4）
 - Android 15 及以上（模块 `minSdk 35`）
 - 支持现代模块 API 的 LSPosed，API 版本 **102**
-- 当前主要在 AirPods Pro 2 上验证
+- 当前主要在 AirPods Pro 3 上验证
 
 模块静态作用域：
 
